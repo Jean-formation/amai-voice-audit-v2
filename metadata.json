@@ -1,0 +1,7 @@
+{
+  "name": "amai_voice_v1-8-1_5-deploy_2_vercel",
+  "description": "Agent vocal intelligent pour l'audit de maturité IA & Digital Memo5D. Interview en langage naturel avec normalisation JSON pour Notion via n8n.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
