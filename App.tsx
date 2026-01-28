@@ -541,7 +541,8 @@ ${QUESTIONS.map(q => `- ${q.id}: "${q.label}"`).join('\n')}`;
             if (message.serverContent?.interrupted) stopAllAudio();
 
             if (message.toolCall) {
-              for (const fc of message.toolCall.functionCalls) {
+              // Ajout d'une sécurité (|| []) pour satisfaire TypeScript strict
+              for (const fc of (message.toolCall.functionCalls || [])) {
                 let res = "";
                 if (fc.name === 'record_answer') res = handleRecordAnswer(fc.args);
                 if (fc.name === 'technical_closure') res = handleTechnicalClosure();
