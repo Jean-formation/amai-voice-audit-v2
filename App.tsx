@@ -148,12 +148,24 @@ const App: React.FC = () => {
   }, [currentSession?.transcript, currentInputText, currentOutputText]);
 
   useEffect(() => {
-    const checkKey = async () => {
-      const hasKey = await (window as any).aistudio.hasSelectedApiKey();
-      setIsKeySelected(hasKey);
-    };
-    checkKey();
-  }, []);
+  const checkKey = async () => {
+    try {
+      const aistudio = (window as any)?.aistudio;
+      // Si on n'est pas dans Google AI Studio, on considère "OK" pour ne pas bloquer l'app
+      if (!aistudio?.hasSelectedApiKey) {
+        setIsKeySelected(true);
+        return;
+      }
+      const hasKey = await aistudio.hasSelectedApiKey();
+      setIsKeySelected(!!hasKey);
+    } catch (e) {
+      // en cas d'erreur, on ne bloque pas l'UI
+      setIsKeySelected(true);
+    }
+  };
+
+  checkKey();
+}, []);
 
   const resetSilenceTimer = () => {
     if (silenceTimerRef.current) {
@@ -401,9 +413,18 @@ Retourne UNIQUEMENT le JSON final. SANS AUCUN FORMATAGE MARKDOWN.`;
   };
 
   const startInterview = async () => {
-    const hasKey = await (window as any).aistudio.hasSelectedApiKey();
-    if (!hasKey) { await (window as any).aistudio.openSelectKey(); return; }
-    if (isActive) { await stopInterview(); return; }
+  const aistudio = (window as any)?.aistudio;
+
+  // Si on est dans AI Studio, on garde le mécanisme d'ouverture de clé
+  if (aistudio?.hasSelectedApiKey) {
+    const hasKey = await aistudio.hasSelectedApiKey();
+    if (!hasKey) {
+      await aistudio.openSelectKey?.();
+      return;
+    }
+  }
+
+  // ... le reste de ton startInterview inchangé
     
     setErrorMsg(null);
     setSubmissionStatus('idle');
