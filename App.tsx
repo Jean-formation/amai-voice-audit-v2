@@ -252,7 +252,7 @@ const App: React.FC = () => {
   };
 
   const normalizeAuditData = async (transcript: { role: string; text: string }[], rawData: AuditData, signal?: AbortSignal) => {
-    const apiKey = process.env.API_KEY;
+    const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
     if (!apiKey) throw new Error("API Key missing");
     
     const ai = new GoogleGenAI({ apiKey });
@@ -332,7 +332,7 @@ Retourne UNIQUEMENT le JSON final. SANS AUCUN FORMATAGE MARKDOWN.`;
     const endpoint = isVercelEnvironment ? API_SUBMIT_ENDPOINT : DIRECT_WEBHOOK_URL;
     
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 45000); // Global timeout 45s
+    const timeoutId = setTimeout(() => controller.abort(), 90000); // Global timeout 90s
 
     try {
       const currentSess = sessionsRef.current.find(s => s.id === currentSessionIdRef.current);
@@ -446,15 +446,18 @@ Retourne UNIQUEMENT le JSON final. SANS AUCUN FORMATAGE MARKDOWN.`;
       
       setIsActive(true);
 
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const ai = new GoogleGenAI({ apiKey: import.meta.env.VITE_GOOGLE_API_KEY });
       
       const currentQ = QUESTIONS[sessionToUse.currentStep] || QUESTIONS[0];
 
       const systemInstruction = `Tu es AMAI, consultant senior Memo5D. Ta mission est de réaliser un audit de maturité IA et Digital.
 
 RÈGLES DE VOIX :
-- Adopte une voix grave, calme, posée mais dynamique. 
+- Adopte un ton de voix baryton, très calme et profond.
 - Maintiens une assurance sereine et une tessiture basse.
+- Ton débit de parole doit être naturel et posé, comme celui d'un consultant senior à l'écoute. 
+- Évite toute excitation ou montée dans les aigus. 
+- Marque des pauses naturelles entre tes phrases pour renforcer l'aspect analytique et serein.
 
 RÈGLES DE FLUX ET SÉQUENÇAGE (CRITIQUES) :
 1. VERROU DE PONCTUATION : Une seule question par intervention.
@@ -583,7 +586,7 @@ ${QUESTIONS.map(q => `- ${q.id}: "${q.label}"`).join('\n')}`;
         },
         config: {
           responseModalities: [Modality.AUDIO],
-          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Fenrir' } } },
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Charon' } } },
           systemInstruction,
           tools: [{ functionDeclarations: [recordAnswerFunction, technicalClosureFunction] }],
           inputAudioTranscription: {},
