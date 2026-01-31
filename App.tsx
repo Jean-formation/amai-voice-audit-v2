@@ -332,7 +332,7 @@ Retourne UNIQUEMENT le JSON final. SANS AUCUN FORMATAGE MARKDOWN.`;
     const endpoint = isVercelEnvironment ? API_SUBMIT_ENDPOINT : DIRECT_WEBHOOK_URL;
     
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 90000); // Global timeout 90s
+    const timeoutId = setTimeout(() => controller.abort(), 300000); // Global timeout 90s
 
     try {
       const currentSess = sessionsRef.current.find(s => s.id === currentSessionIdRef.current);
