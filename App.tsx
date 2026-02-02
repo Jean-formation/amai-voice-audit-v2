@@ -3,6 +3,7 @@ import { GoogleGenAI, LiveServerMessage, Modality, Type, FunctionDeclaration } f
 import { QUESTIONS, SOURCE_TAG } from './constants';
 import { QuestionType, AuditData } from './types';
 import { createBlobFromAudio, decode, decodeAudioData, encode } from './services/audioService';
+import Avatar from "./components/Avatar";
 
 const GEMINI_MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025';
 const FLASH_MODEL = 'gemini-3-flash-preview';
@@ -630,10 +631,19 @@ ${QUESTIONS.map(q => `- ${q.id}: "${q.label}"`).join('\n')}`;
       <div className="w-full max-w-md bg-white rounded-[3rem] shadow-2xl overflow-hidden flex flex-col relative aspect-[9/16] border border-gray-100">
         <div className="h-[42%] flex flex-col items-center justify-center p-8 bg-gradient-to-b from-blue-50/50 via-white to-white relative">
           <div className="relative">
-            <div className={`w-36 h-36 rounded-full overflow-hidden shadow-2xl border-4 border-white transition-all duration-500 transform ${isActive ? 'scale-110 shadow-blue-200' : 'scale-100'} relative`}>
-              <div className={`absolute inset-0 transition-opacity duration-500 bg-gradient-to-br from-blue-400 to-blue-800 ${isActive ? 'opacity-0' : 'opacity-100'}`} />
-              <div className={`absolute inset-0 transition-opacity duration-500 bg-gradient-to-tr from-indigo-500 via-purple-500 to-cyan-400 ${isActive ? 'opacity-100' : 'opacity-0'} ${isActive ? 'animate-orb-rotate' : ''}`} />
-              <div className={`absolute inset-0 bg-white/10 ${isActive ? 'animate-pulse' : ''}`} />
+            <div className="relative">
+              <div
+                className={`transition-all duration-500 transform ${
+                  isActive ? "scale-110 shadow-blue-200" : "scale-100"
+                }`}
+              >
+                <Avatar
+                  size={144} // w-36/h-36 = 9rem = 144px
+                  state={currentSession?.isFinished ? "finished" : isActive ? "responding" : "idle"}
+                  reactToMic={false} // étape 1 : valider le rendu, zéro impact micro
+                  reducedMotion={false}
+                />
+              </div>
             </div>
           </div>
           <button onClick={startInterview} className={`mt-10 w-20 h-20 rounded-full shadow-2xl flex items-center justify-center transition-all duration-300 hover:scale-105 active:scale-95 ${isActive ? 'bg-red-500' : 'bg-gray-900'}`}>{isActive ? <div className="w-6 h-6 bg-white rounded-sm" /> : <svg className="w-10 h-10 text-white ml-1" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg>}</button>
