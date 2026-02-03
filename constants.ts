@@ -266,3 +266,11 @@ export const QUESTIONS: Question[] = [
     notionKey: "Consentement RGPD (Oui/Non)"
   }
 ];
+/**
+ * Fallbacks métiers pour les questions SANS option "Autre".
+ * - Clé = notionKey
+ * - Valeur = libellé EXACT d'une option existante
+ *
+ * Optionnel: si non renseigné pour une question, le code prendra la 1ère option disponible.
+ */
+export const NORMALIZATION_FALLBACKS_BY_NOTION_KEY: Record<string, string> = {};
