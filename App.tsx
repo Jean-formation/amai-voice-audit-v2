@@ -14,7 +14,7 @@ const API_SUBMIT_ENDPOINT = "/api/submit";
 const DIRECT_WEBHOOK_URL = "https://n8n.srv1071841.hstgr.cloud/webhook/AMAI_Voice_v1_gais";
 // Timeouts: on garde large côté envoi (réseaux mobiles / n8n), mais on limite strictement l'IA.
 const SUBMIT_TIMEOUT_MS = 300000; // 300s
-const AI_NORMALIZE_TIMEOUT_MS = 10000; // 10s: 1 tentative, pas de boucle
+const AI_NORMALIZE_TIMEOUT_MS = 120000; // 120s: laisse le temps au modèle, sans bloquer 5 min
 
 interface Session {
   id: string;
@@ -273,37 +273,252 @@ const buildGuaranteedPayload = (
   const autreLabel = (q: any): string => (q.triggerAutre && typeof q.triggerAutre === 'string') ? q.triggerAutre : "Autre";
 
   const ensureSelect = (q: any, value: any): string => {
-    const opts = getAllowed(q);
-    const v = typeof value === 'string' ? value.trim() : '';
-    if (opts.includes(v)) return v;
+  const opts = getAllowed(q);
+  const vRaw = (value ?? '').toString().trim();
 
-    // Si "Autre" est autorisé, on force "Autre" et on stocke le brut.
-    if (hasAutre(q)) {
-      if (q.autreKey && !base[q.autreKey]) base[q.autreKey] = String(value ?? '').trim();
-      return autreLabel(q);
+  // 0) Cas vide
+  if (!vRaw) {
+    // Si "Autre" autorisé, on force Autre (mais Q01–Q05 n'ont pas Autre)
+    if (hasAutre(q)) return autreLabel(q);
+    // Sinon, on force une option (contrainte métier)
+    return opts[0] ?? '';
+  }
+
+  // 1) Match direct (libellé exact)
+  if (opts.includes(vRaw)) return vRaw;
+
+  // 2) Accepter un index "1..N" (robuste au LLM)
+  // Ex: "2" -> opts[1]
+  if (/^\d+$/.test(vRaw)) {
+    const idx = parseInt(vRaw, 10);
+    if (Number.isFinite(idx) && idx >= 1 && idx <= opts.length) return opts[idx - 1];
+  }
+
+  // 3) Normalisation simple (accents / casse / ponctuation)
+  const norm = (s: string) =>
+    s
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/['’]/g, "'")
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim();
+
+  const v = norm(vRaw);
+  const optByNorm = new Map(opts.map((o) => [norm(o), o]));
+  if (optByNorm.has(v)) return optByNorm.get(v)!;
+
+  // 4) Heuristiques Q01–Q05 (sans "Autre") : choisir une option plausible plutôt que opts[0]
+  // On détecte Q01–Q05 via questionId si disponible, sinon via notionKey.
+  const qid = (q.questionId ?? q.id ?? '').toString();
+  const nk = (q.notionKey ?? '').toString();
+
+  const isQ01toQ05 =
+    /^q0[1-5]$/i.test(qid) ||
+    /Maturité\s*–\s*(Stratégie|Données|Process|Gouvernance|Compétences)/i.test(nk);
+
+  if (isQ01toQ05 && opts.length >= 4) {
+    // Score simple par mots-clés (à affiner si besoin)
+    const scoreByIndex = [0, 0, 0, 0]; // pour opts[0..3]
+
+    const add = (i: number, w: number) => { scoreByIndex[i] += w; };
+
+    // Mots-clés "exploration" (option 1)
+    if (/\b(explore|exploration|test|pilote|poc|debut|commence)\b/.test(v)) add(0, 2);
+    if (/\b(pas\s+de\s+strategie|aucun\s+cadre|rien\s+de\s+structure)\b/.test(v)) add(0, 3);
+
+    // Mots-clés "projets spécifiques" (option 2)
+    if (/\b(projet|cas\s+d\s+usage|use\s+case|ponctuel|quelques)\b/.test(v)) add(1, 2);
+    if (/\b(non\s+etendu|pas\s+generalise|pas\s+a\s+l\s+echelle)\b/.test(v)) add(1, 2);
+
+    // Mots-clés "entreprise / déploiement" (option 3)
+    if (/\b(entreprise|global|transverse|deploi|mise\s+en\s+place|en\s+cours)\b/.test(v)) add(2, 2);
+    if (/\b(structure|formalise|strategie\s+claire)\b/.test(v)) add(2, 2);
+
+    // Mots-clés "intégrée / innovation" (option 4)
+    if (/\b(integre|integration|aligne|commercial|innovation|avantage|competitif)\b/.test(v)) add(3, 2);
+    if (/\b(stimule|accelere|transforme)\b/.test(v)) add(3, 1);
+
+    // Cas Q02 (données) : orienter vers niveau 3 si "structuré/consolidé"
+    if (/Donnees|Données/i.test(nk)) {
+      if (/\b(structure|consolide|centralise|plateforme|gouvernance)\b/.test(v)) add(2, 3);
+      if (/\b(cloisonne|inaccessible)\b/.test(v)) add(0, 3);
     }
 
-    // Sinon fallback métier (si défini), sinon 1ère option.
-    const fb = NORMALIZATION_FALLBACKS_BY_NOTION_KEY[q.notionKey];
-    if (fb && opts.includes(fb)) return fb;
-    return opts[0] ?? '';
-  };
+    // Choisir le meilleur score
+    let bestIdx = 0;
+    for (let i = 1; i < 4; i++) {
+      if (scoreByIndex[i] > scoreByIndex[bestIdx]) bestIdx = i;
+    }
+
+    // Si tout est à 0, on ne force pas option 1 : on passe au fallback métier puis au "plus proche"
+    const maxScore = Math.max(...scoreByIndex);
+    if (maxScore > 0) return opts[bestIdx];
+  }
+
+  // 5) Si "Autre" est autorisé, on force "Autre" et on stocke le brut
+  if (hasAutre(q)) {
+    if (q.autreKey && !base[q.autreKey]) base[q.autreKey] = vRaw;
+    return autreLabel(q);
+  }
+
+  // 6) Fallback métier explicite si défini
+  const fb = NORMALIZATION_FALLBACKS_BY_NOTION_KEY[q.notionKey];
+  if (fb && opts.includes(fb)) return fb;
+
+  // 7) Dernier recours (contrainte métier) : on force une option MAIS PAS forcément opts[0]
+  // -> on choisit celle dont la normalisation est la plus proche (simple)
+  let best = opts[0] ?? '';
+  let bestScore = -1;
+  const tokens = new Set(v.split(' ').filter(Boolean));
+  for (const o of opts) {
+    const on = norm(o);
+    const ot = new Set(on.split(' ').filter(Boolean));
+    let inter = 0;
+    for (const t of tokens) if (ot.has(t)) inter++;
+    const union = tokens.size + ot.size - inter;
+    const sc = union ? inter / union : 0;
+    if (sc > bestScore) { bestScore = sc; best = o; }
+  }
+  return best;
+};
 
   const ensureMultiSelect = (q: any, value: any): string[] => {
-    const opts = getAllowed(q);
-    const arr = Array.isArray(value) ? value : (typeof value === 'string' && value ? [value] : []);
-    const cleaned = arr.map(v => String(v).trim()).filter(v => opts.includes(v));
+  const opts = getAllowed(q);
+  const maxItems = q.maxItems || opts.length;
 
-    if (cleaned.length > 0) return cleaned.slice(0, q.maxItems || cleaned.length);
+  // --- helpers
+  const norm = (s: string) =>
+    String(s ?? '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/['’]/g, '')
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim();
 
-    // Si Autre autorisé: on met Autre + brut dans autreKey
-    if (hasAutre(q)) {
-      if (q.autreKey && !base[q.autreKey]) base[q.autreKey] = String(value ?? '').trim();
-      return [autreLabel(q)];
+  const pushUnique = (arr: string[], v: string) => {
+    if (v && !arr.includes(v)) arr.push(v);
+  };
+
+  const parseTokens = (v: any): string[] => {
+    if (Array.isArray(v)) return v.map(x => String(x ?? '').trim()).filter(Boolean);
+    if (typeof v === 'string') {
+      // support: "1", "1. xxx", "1,2,3", "a; b; c", lignes, etc.
+      return v
+        .split(/[\n,;|]+/g)
+        .map(x => x.trim())
+        .filter(Boolean);
     }
-
     return [];
   };
+
+  const tokenToOptionByIndex = (t: string): string | null => {
+    // "1" / "1." / "1 - ..." => option #1
+    const m = /^(\d{1,2})\b/.exec(t);
+    if (!m) return null;
+    const idx = parseInt(m[1], 10);
+    if (!Number.isFinite(idx) || idx < 1 || idx > opts.length) return null;
+    return opts[idx - 1];
+  };
+
+  // --- 1) Try explicit values (exact match) + index forms
+  const rawTokens = parseTokens(value);
+  const selected: string[] = [];
+
+  for (const t of rawTokens) {
+    const byIndex = tokenToOptionByIndex(t);
+    if (byIndex) {
+      pushUnique(selected, byIndex);
+      continue;
+    }
+    if (opts.includes(t)) {
+      pushUnique(selected, t);
+      continue;
+    }
+    // tolerate "n. Libellé" exact libellé
+    const t2 = t.replace(/^\d+\s*[.)-]\s*/g, '').trim();
+    if (opts.includes(t2)) pushUnique(selected, t2);
+  }
+
+  if (selected.length > 0) return selected.slice(0, maxItems);
+
+  // --- 2) If still empty, infer from "*-Autre" when present (Q17–Q19 mainly)
+  const autreText =
+    (q.autreKey && typeof base[q.autreKey] === 'string' && base[q.autreKey].trim())
+      ? String(base[q.autreKey]).trim()
+      : (typeof value === 'string' ? value.trim() : '');
+
+  const nk = String(q.notionKey ?? '');
+  const qid = String(q.questionId ?? '');
+
+  const isQ17toQ19 =
+    /q17|q18|q19/i.test(qid) ||
+    /(Objectifs IA-Digital|Défis prioritaires|Attentes IA-Digital)/i.test(nk);
+
+  if (isQ17toQ19 && autreText) {
+    const t = norm(autreText);
+
+    // scoring par regex -> index option
+    const scored: number[] = new Array(opts.length).fill(0);
+    const add = (idx0: number, w: number) => { if (idx0 >= 0 && idx0 < scored.length) scored[idx0] += w; };
+
+    // Q17 Objectifs (11 options dont "Autre" en dernier)
+    if (/Objectifs IA-Digital/i.test(nk) || /q17/i.test(qid)) {
+      if (/\b(cycle de vente|vente|crm|prospection|pipeline|commercial)\b/.test(t)) add(0, 3);
+      if (/\b(tableau de bord|dashboard|kpi|reporting|pilotage)\b/.test(t)) add(1, 3);
+      if (/\b(assistant|automatiser|administratif|factur|compta|rh)\b/.test(t)) add(2, 3);
+      if (/\b(recommandation|personnalis|produit|contenu)\b/.test(t)) add(3, 3);
+      if (/\b(anomalie|qualite|defaut|controle|production)\b/.test(t)) add(4, 3);
+      if (/\b(maintenance|predict|equipement|panne)\b/.test(t)) add(5, 3);
+      if (/\b(strategie)\b/.test(t)) {
+        if (/\b(commercial)\b/.test(t)) add(6, 2);
+        if (/\b(innovation)\b/.test(t)) add(7, 2);
+        if (/\b(finance|fiscal)\b/.test(t)) add(8, 2);
+        if (/\b(management|organisation)\b/.test(t)) add(9, 2);
+      }
+    }
+
+    // Q18 Défis (9 options dont "Autre" en dernier)
+    if (/Défis prioritaires/i.test(nk) || /q18/i.test(qid)) {
+      if (/\b(strategie|data)\b/.test(t)) add(0, 3);
+      if (/\b(process|productiv|automatis)\b/.test(t)) add(1, 3);
+      if (/\b(croissance|commercial|differenci|concurr)\b/.test(t)) add(2, 3);
+      if (/\b(donnees|valoris|data management|qualite)\b/.test(t)) add(3, 3);
+      if (/\b(marge|cout)\b/.test(t)) add(4, 3);
+      if (/\b(satisfaction|client|experience)\b/.test(t)) add(5, 3);
+      if (/\b(rgpd|ai act|ethique|conform)\b/.test(t)) add(6, 3);
+      if (/\b(recrut|competenc|formation|skill)\b/.test(t)) add(7, 3);
+    }
+
+    // Q19 Attentes (6 options dont "Autre" en dernier)
+    if (/Attentes IA-Digital/i.test(nk) || /q19/i.test(qid)) {
+      if (/\b(proposition de valeur|valeur)\b/.test(t)) add(0, 3);
+      if (/\b(feuille de route|roadmap|strateg)\b/.test(t)) add(1, 3);
+      if (/\b(operationnel|automatis|process)\b/.test(t)) add(2, 3);
+      if (/\b(productiv|temps|gagner du temps)\b/.test(t)) add(3, 3);
+      if (/\b(marge)\b/.test(t)) add(4, 3);
+    }
+
+    // sélection des meilleurs scores (>0)
+    const ranked = scored
+      .map((score, idx) => ({ idx, score }))
+      .filter(x => x.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, maxItems)
+      .map(x => opts[x.idx]);
+
+    if (ranked.length > 0) return ranked;
+  }
+
+  // --- 3) Fallback: Autre si autorisé (et stocker le brut), sinon []
+  if (hasAutre(q)) {
+    if (q.autreKey && !base[q.autreKey]) base[q.autreKey] = String(autreText || value || '').trim();
+    return [autreLabel(q)];
+  }
+
+  return [];
+};
 
   const ensureBool = (value: any): boolean => {
     if (typeof value === 'boolean') return value;
@@ -608,8 +823,27 @@ RÈGLES d'OR :
 2. EMAIL (q20) : Indique que l'email peut être vérifié sous l'avatar.
 3. FIN d'AUDIT : Prononce exactement cette phrase : "Merci pour votre participation à cet audit, vous allez recevoir votre rapport d'audit par email d'ici quelques minutes, à bientôt sur memo5d.fr".
 
-LISTE DES QUESTIONS :
-${QUESTIONS.map(q => `- ${q.id}: "${q.label}"`).join('\n')}`;
+RÈGLES DE CLARIFICATION (uniquement Q01–Q05 — questions fermées sans "Autre") :
+- L’utilisateur peut répondre librement et longuement.
+- Si sa réponse ne permet PAS de choisir une option avec certitude :
+  1) Propose exactement 2 options plausibles numérotées 1) et 2) (prises dans la liste d’options).
+  2) Pose UNE question : "Répondez 1 ou 2."
+  3) N'appelle PAS record_answer tant que l’utilisateur n’a pas répondu 1 ou 2.
+- Quand l’utilisateur répond "1" ou "2" : appelle record_answer avec value="1" ou value="2" (texte brut).
+
+RÈGLES DE RÉPONSE (Select / Multi-select) :
+- Pour les questions SELECT : si tu appelles record_answer, tu peux fournir soit le LIBELLÉ exact, soit un INDEX "1", "2", "3"...
+- Pour les questions MULTI_SELECT : multiValues peut contenir des LIBELLÉS exacts ou des INDEX "1", "2", etc. (séparés si besoin).
+- Pour Q17–Q19 (si "Autre" est autorisé) : si la réponse ne rentre pas dans les options, utilise "Autre" + autreValue avec le texte libre.
+
+LISTE DES QUESTIONS ET OPTIONS (pour aider la sélection) :
+${QUESTIONS.map(q => {
+  const opts = Array.isArray((q as any).options) ? (q as any).options : [];
+  const optsText = opts.length
+    ? opts.map((o: string, i: number) => `${i + 1}) ${o}`).join(' | ')
+    : '(pas d’options)';
+  return `- ${q.id}: "${q.label}" | type=${q.type} | options: ${optsText}`;
+}).join('\n')}`;
 
       const sessionPromise = ai.live.connect({
         model: GEMINI_MODEL,
