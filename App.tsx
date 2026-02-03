@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality, Type, FunctionDeclaration } from '@google/genai';
-import { QUESTIONS, SOURCE_TAG } from './constants';
+import { QUESTIONS, SOURCE_TAG, NORMALIZATION_FALLBACKS_BY_NOTION_KEY } from './constants';
 import { QuestionType, AuditData } from './types';
 import { createBlobFromAudio, decode, decodeAudioData, encode } from './services/audioService';
 
@@ -12,6 +12,9 @@ const CURRENT_SESSION_ID_KEY = 'amai_audit_v2_current_id';
 const API_SUBMIT_ENDPOINT = "/api/submit";
 // URL Directe pour le test/preview (évite le 404 si le dossier /api n'est pas servi localement)
 const DIRECT_WEBHOOK_URL = "https://n8n.srv1071841.hstgr.cloud/webhook/AMAI_Voice_v1_gais";
+// Timeouts: on garde large côté envoi (réseaux mobiles / n8n), mais on limite strictement l'IA.
+const SUBMIT_TIMEOUT_MS = 300000; // 300s
+const AI_NORMALIZE_TIMEOUT_MS = 10000; // 10s: 1 tentative, pas de boucle
 
 interface Session {
   id: string;
@@ -251,119 +254,251 @@ const App: React.FC = () => {
     return new Promise(resolve => source.onended = resolve);
   };
 
-  const normalizeAuditData = async (transcript: { role: string; text: string }[], rawData: AuditData, signal?: AbortSignal) => {
+  /**
+ * Garantit le contrat de sortie: valeurs enum valides (ou "Autre" si autorisé) + texte libre conservé.
+ * La normalisation LLM peut enrichir, mais ne doit JAMAIS bloquer ni casser le JSON.
+ */
+const buildGuaranteedPayload = (
+  rawData: AuditData,
+  transcript: { role: string; text: string }[],
+  candidate: Record<string, any> | null
+) => {
+  const base: Record<string, any> = { ...rawData, ...(candidate || {}) };
+
+  const getAllowed = (q: any): string[] => Array.isArray(q.options) ? q.options : [];
+  const hasAutre = (q: any): boolean => {
+    const opts = getAllowed(q);
+    return !!q.autreKey && (q.triggerAutre ? opts.includes(q.triggerAutre) : opts.includes("Autre"));
+  };
+  const autreLabel = (q: any): string => (q.triggerAutre && typeof q.triggerAutre === 'string') ? q.triggerAutre : "Autre";
+
+  const ensureSelect = (q: any, value: any): string => {
+    const opts = getAllowed(q);
+    const v = typeof value === 'string' ? value.trim() : '';
+    if (opts.includes(v)) return v;
+
+    // Si "Autre" est autorisé, on force "Autre" et on stocke le brut.
+    if (hasAutre(q)) {
+      if (q.autreKey && !base[q.autreKey]) base[q.autreKey] = String(value ?? '').trim();
+      return autreLabel(q);
+    }
+
+    // Sinon fallback métier (si défini), sinon 1ère option.
+    const fb = NORMALIZATION_FALLBACKS_BY_NOTION_KEY[q.notionKey];
+    if (fb && opts.includes(fb)) return fb;
+    return opts[0] ?? '';
+  };
+
+  const ensureMultiSelect = (q: any, value: any): string[] => {
+    const opts = getAllowed(q);
+    const arr = Array.isArray(value) ? value : (typeof value === 'string' && value ? [value] : []);
+    const cleaned = arr.map(v => String(v).trim()).filter(v => opts.includes(v));
+
+    if (cleaned.length > 0) return cleaned.slice(0, q.maxItems || cleaned.length);
+
+    // Si Autre autorisé: on met Autre + brut dans autreKey
+    if (hasAutre(q)) {
+      if (q.autreKey && !base[q.autreKey]) base[q.autreKey] = String(value ?? '').trim();
+      return [autreLabel(q)];
+    }
+
+    return [];
+  };
+
+  const ensureBool = (value: any): boolean => {
+    if (typeof value === 'boolean') return value;
+    const v = String(value ?? '').toLowerCase().trim();
+    return (v === 'true' || v === 'oui' || v === 'ok' || v === 'accord' || v === 'yes' || v === "j'accepte" || v === 'accepte');
+  };
+
+  // Enforce question-by-question.
+  for (const q of QUESTIONS) {
+    const current = base[q.notionKey];
+    if (q.type === QuestionType.MULTI_SELECT) {
+      base[q.notionKey] = ensureMultiSelect(q, current);
+    } else if (q.type === QuestionType.BOOL) {
+      base[q.notionKey] = ensureBool(current);
+    } else if (q.type === QuestionType.SELECT) {
+      base[q.notionKey] = ensureSelect(q, current);
+    } else {
+      // STRING ou autres: garder la valeur brute.
+      if (base[q.notionKey] === undefined || base[q.notionKey] === null) base[q.notionKey] = '';
+    }
+  }
+
+  // Champs meta (compat Notion/n8n existants)
+  base.session_id = currentSessionIdRef.current;
+  base.source = SOURCE_TAG;
+  const nowISO = new Date().toISOString();
+  // Tolérant: certains flux existants peuvent attendre l'une ou l'autre clé.
+  base["Date soumission"] = (base["Date soumission"] as any) || nowISO;
+  base["'Date soumission'"] = (base["'Date soumission'"] as any) || base["Date soumission"];
+  base.executionMode = base.executionMode || "production_guarded";
+
+  // Optionnel: si Nom soumission manque, on dérive du mail.
+  if (!base["Nom soumission"] && typeof base["e-mail répondant"] === 'string' && base["e-mail répondant"].includes('@')) {
+    base["Nom soumission"] = String(base["e-mail répondant"]).split('@')[0];
+  }
+
+  return base;
+};
+
+  const normalizeAuditData = async (
+  transcript: { role: string; text: string }[],
+  rawData: AuditData,
+  signal?: AbortSignal
+) => {
+  // Contrat: ne JAMAIS bloquer l'envoi. Si IA KO => payload garanti depuis rawData.
+  try {
     const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
-    if (!apiKey) throw new Error("API Key missing");
-    
+    if (!apiKey) {
+      return buildGuaranteedPayload(rawData, transcript, null);
+    }
+
     const ai = new GoogleGenAI({ apiKey });
+
     const questionsContext = QUESTIONS.map(q => ({
       property: q.notionKey,
       label: q.label,
       options: q.options || [],
       type: q.type,
-      autreKey: q.autreKey
+      autreKey: q.autreKey,
     }));
 
-    const prompt = `Tu es un expert en normalisation de données de haute précision (déterminisme absolu). Ta mission est de convertir le transcript d'un audit vocal et ses données brutes en un JSON strictement valide pour Notion.
+    // Prompt "compatible fallback" = on garde tes règles, mais non-bloquantes.
+    // Le code (buildGuaranteedPayload) garantit la conformité finale.
+    const prompt = `
+    Tu es un assistant de NORMALISATION DE DONNÉES pour un audit vocal.
 
-CONTEXTE :
-Transcript : ${JSON.stringify(transcript)}
-Données brutes de l'agent : ${JSON.stringify(rawData)}
+    OBJECTIF
+    - Proposer un JSON candidat (best-effort) à partir du transcript + données brutes.
+    - Le système appliquera ensuite des règles de validation/fallback : tu n'as pas besoin d'être parfait.
 
-RÈGLES DE MAPPING (CRITIQUE) :
-1. MAPPING SÉMANTIQUE : Si l'utilisateur a utilisé une périphrase ou une réponse libre (ex: "on teste un peu"), tu DOIS choisir l'option la plus proche sémantiquement dans la liste autorisée (ex: "Nous expérimentons les nouvelles technologies à petite échelle et de manière informelle.").
-2. FIDÉLITÉ ABSOLUE : Pour chaque champ de type 'select' ou 'array', tu DOIS retourner la valeur EXACTE (caractères, ponctuation, espaces) telle qu'elle apparaît dans la liste des options fournie.
-3. INTERDICTION DE RÉSUMER : Ne reformule jamais une option de la liste. Fais un COPIER-COLLER exact.
-4. LOGIQUE 'AUTRE' : Utilise l'option "Autre" UNIQUEMENT si aucune option sémantique ne correspond vraiment. Dans ce cas, remplis obligatoirement le champ associé (-Autre) avec la réponse libre reformulée.
-5. NOM ET PRENOM : Identifie le nom de l'utilisateur dans le transcript pour "'Nom soumission'".
-6. MULTI-SELECT : Pour les types 'array', retourne un tableau de chaînes (les libellés exacts).
-7. CONSENTEMENT RGPD (BOOL) : Pour les propriétés de type 'bool', analyse le consentement dans le transcript. Si l'utilisateur exprime son accord (ex: 'Oui', 'D'accord', 'J'accepte'), la valeur DOIT être le booléen true. Sinon false.
+    CONTRAINTES ABSOLUES
+    - Retourne UNIQUEMENT un objet JSON (aucun texte autour, aucun markdown).
+    - Une seule tentative : pas de boucle, pas de "réparation".
+    - Si tu n'es pas sûr d'un champ : laisse-le vide ("") ou omets-le plutôt que d'inventer.
 
-PROPRIÉTÉS ET OPTIONS AUTORISÉES :
-${JSON.stringify(questionsContext, null, 2)}
+    RÈGLES DE MAPPING (BEST-EFFORT)
+    1) Mapping sémantique : si réponse libre, choisis l'option la plus proche parmi les options autorisées.
+    2) Fidélité libellés : pour select/multi-select, utilise des libellés EXACTS présents dans les options (copier-coller).
+    3) Ne reformule jamais un libellé d'option.
+    4) Logique "Autre" : n'utilise "Autre" que si aucune option ne convient ; dans ce cas conserve le texte libre dans le champ "-Autre" associé quand il existe.
+    7) Consentement RGPD (bool) : si l'utilisateur exprime un accord (ex: "oui", "d'accord", "ok", "j'accepte"), mets true ; sinon false.
 
-Retourne UNIQUEMENT le JSON final. SANS AUCUN FORMATAGE MARKDOWN.`;
+    DONNÉES
+    Transcript: ${JSON.stringify(transcript)}
+    Données brutes déjà collectées: ${JSON.stringify(rawData)}
+    Questions / options: ${JSON.stringify(questionsContext, null, 2)}
+  `.trim();
 
+    const aiPromise = ai.models.generateContent({
+      model: FLASH_MODEL,
+      contents: [{ parts: [{ text: prompt }] }],
+      config: {
+        responseMimeType: "application/json",
+        temperature: 0,
+      },
+    });
+
+    const timeoutPromise = new Promise((_, reject) => {
+      const t = setTimeout(() => reject(new Error("AI_NORMALIZE_TIMEOUT")), AI_NORMALIZE_TIMEOUT_MS);
+      signal?.addEventListener?.("abort", () => {
+        clearTimeout(t);
+        reject(new Error("AI_ABORTED"));
+      });
+    });
+
+    const response: any = await Promise.race([aiPromise, timeoutPromise]);
+
+    // Parsing tolérant (SDK peut exposer .text en string ou en function)
+    let candidate: Record<string, any> | null = null;
     try {
-      // Intégration du timeout de 45s pour l'IA
-      const aiPromise = ai.models.generateContent({
-        model: FLASH_MODEL,
-        contents: [{ parts: [{ text: prompt }] }],
-        config: { 
-          responseMimeType: "application/json",
-          temperature: 0 
-        }
-      });
+      const rawText =
+        typeof response?.text === "function"
+          ? response.text()
+          : (response?.text ?? "{}");
 
-      const timeoutPromise = new Promise((_, reject) => {
-        const timer = setTimeout(() => reject(new Error("Timeout IA (45s) dépassé")), 45000);
-        signal?.addEventListener('abort', () => { clearTimeout(timer); reject(new Error("Aborted")); });
-      });
+      const cleaned = String(rawText).replace(/```json/g, "").replace(/```/g, "").trim();
+      const parsed = JSON.parse(cleaned || "{}");
 
-      const response: any = await Promise.race([aiPromise, timeoutPromise]);
-
-      let text = response.text || "{}";
-      text = text.replace(/```json/g, "").replace(/```/g, "").trim();
-      const normalized = JSON.parse(text);
-
-      if (!normalized || Object.keys(normalized).length === 0) {
-        throw new Error("Empty normalization result");
-      }
-      
-      return {
-        ...normalized,
-        session_id: currentSessionIdRef.current,
-        source: SOURCE_TAG,
-        "'Date soumission'": normalized["'Date soumission'"] || new Date().toISOString(),
-        executionMode: "production_normalized"
-      };
-    } catch (e) {
-      console.error("Critical normalization error:", e);
-      throw e; 
+      candidate = parsed && typeof parsed === "object" ? parsed : null;
+    } catch {
+      candidate = null;
     }
-  };
 
-  const submitToWebhook = async (rawData: AuditData, retryCount = 0) => {
-    setSubmissionStatus('submitting');
-    setErrorMsg(null);
-    
-    // Détection immédiate de l'environnement pour éviter le gel du proxy 404
-    const isVercelEnvironment = window.location.hostname.endsWith('vercel.app');
-    const endpoint = isVercelEnvironment ? API_SUBMIT_ENDPOINT : DIRECT_WEBHOOK_URL;
-    
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 300000); // Global timeout 90s
+    // Contrat final garanti ici
+    return buildGuaranteedPayload(rawData, transcript, candidate);
+  } catch (e) {
+    console.error("normalizeAuditData guarded fail:", e);
+    return buildGuaranteedPayload(rawData, transcript, null);
+  }
+};
 
-    try {
-      const currentSess = sessionsRef.current.find(s => s.id === currentSessionIdRef.current);
-      const transcript = currentSess?.transcript || [];
-      
-      // La normalisation respecte aussi le timeout
-      const payload = await normalizeAuditData(transcript, rawData, controller.signal);
+  /**
+ * submitToWebhook
+ * - Timeout global unique (IA + POST)
+ * - Aucun retry client (déterminisme, pas de double envoi)
+ * - Compatible Vercel / AbortController
+ */
+  const submitToWebhook = async (rawData: AuditData) => {
+  setSubmissionStatus("submitting");
+  setErrorMsg(null);
 
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify(payload)
-      });
+  // PROD Vercel = /api/submit ; DEV local = webhook direct
+  const endpoint = import.meta.env.PROD
+    ? API_SUBMIT_ENDPOINT
+    : DIRECT_WEBHOOK_URL;
 
-      clearTimeout(timeoutId);
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(
+    () => controller.abort(),
+    SUBMIT_TIMEOUT_MS // 300s
+  );
 
-      if (!response.ok) throw new Error(`HTTP Error: ${response.status}`);
-      setSubmissionStatus('success');
-    } catch (error: any) {
-      clearTimeout(timeoutId);
-      console.error(`Attempt ${retryCount + 1} failed:`, error);
-      
-      if (retryCount < 1 && error.name !== 'AbortError') {
-        return submitToWebhook(rawData, retryCount + 1);
-      }
+  try {
+    const currentSess = sessionsRef.current.find(
+      (s) => s.id === currentSessionIdRef.current
+    );
+    const transcript = currentSess?.transcript || [];
 
-      setErrorMsg(error.name === 'AbortError' ? "Le délai de transmission a été dépassé (45s)." : "La normalisation des données a échoué. Veuillez contacter le support.");
-      setSubmissionStatus('error');
+    const payload = await normalizeAuditData(
+      transcript,
+      rawData,
+      controller.signal
+    );
+
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP Error: ${response.status}`);
     }
-  };
+
+    setSubmissionStatus("success");
+  } catch (error: any) {
+    console.error("submitToWebhook failed:", error);
+
+    const isTimeout =
+      error?.name === "AbortError" ||
+      String(error?.message || "").includes("AI_ABORTED") ||
+      String(error?.message || "").includes("AI_NORMALIZE_TIMEOUT");
+
+    setErrorMsg(
+      isTimeout
+        ? "Le délai de transmission a été dépassé (300s)."
+        : "La transmission des données a échoué. Veuillez contacter le support."
+    );
+
+    setSubmissionStatus("error");
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+};
 
   const handleRecordAnswer = (args: any) => {
     if (!currentSessionIdRef.current) return "Erreur session.";
