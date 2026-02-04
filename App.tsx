@@ -558,20 +558,14 @@ const buildGuaranteedPayload = (
   return base;
 };
 
-  const normalizeAuditData = async (
+const normalizeAuditData = async (
   transcript: { role: string; text: string }[],
   rawData: AuditData,
   signal?: AbortSignal
 ) => {
   // Contrat: ne JAMAIS bloquer l'envoi. Si IA KO => payload garanti depuis rawData.
   try {
-    const apiKey = import.meta.env.VITE_GOOGLE_API_KEY;
-    if (!apiKey) {
-      return buildGuaranteedPayload(rawData, transcript, null);
-    }
-
-    const ai = new GoogleGenAI({ apiKey });
-
+    // Côté client : pas de clé. On appelle le proxy serveur /api/normalize
     const questionsContext = QUESTIONS.map(q => ({
       property: q.notionKey,
       label: q.label,
@@ -580,72 +574,67 @@ const buildGuaranteedPayload = (
       autreKey: q.autreKey,
     }));
 
-    // Prompt "compatible fallback" = on garde tes règles, mais non-bloquantes.
-    // Le code (buildGuaranteedPayload) garantit la conformité finale.
+    // Prompt identique (pas secret). Le serveur renverra un "candidate" JSON.
     const prompt = `
-    Tu es un assistant de NORMALISATION DE DONNÉES pour un audit vocal.
+Tu es un assistant de NORMALISATION DE DONNÉES pour un audit vocal.
 
-    OBJECTIF
-    - Proposer un JSON candidat (best-effort) à partir du transcript + données brutes.
-    - Le système appliquera ensuite des règles de validation/fallback : tu n'as pas besoin d'être parfait.
+OBJECTIF
+- Proposer un JSON candidat (best-effort) à partir du transcript + données brutes.
+- Le système appliquera ensuite des règles de validation/fallback : tu n'as pas besoin d'être parfait.
 
-    CONTRAINTES ABSOLUES
-    - Retourne UNIQUEMENT un objet JSON (aucun texte autour, aucun markdown).
-    - Une seule tentative : pas de boucle, pas de "réparation".
-    - Si tu n'es pas sûr d'un champ : laisse-le vide ("") ou omets-le plutôt que d'inventer.
+CONTRAINTES ABSOLUES
+- Retourne UNIQUEMENT un objet JSON (aucun texte autour, aucun markdown).
+- Une seule tentative : pas de boucle, pas de "réparation".
+- Si tu n'es pas sûr d'un champ : laisse-le vide ("") ou omets-le plutôt que d'inventer.
 
-    RÈGLES DE MAPPING (BEST-EFFORT)
-    1) Mapping sémantique : si réponse libre, choisis l'option la plus proche parmi les options autorisées.
-    2) Fidélité libellés : pour select/multi-select, utilise des libellés EXACTS présents dans les options (copier-coller).
-    3) Ne reformule jamais un libellé d'option.
-    4) Logique "Autre" : n'utilise "Autre" que si aucune option ne convient ; dans ce cas conserve le texte libre dans le champ "-Autre" associé quand il existe.
-    7) Consentement RGPD (bool) : si l'utilisateur exprime un accord (ex: "oui", "d'accord", "ok", "j'accepte"), mets true ; sinon false.
+RÈGLES DE MAPPING (BEST-EFFORT)
+1) Mapping sémantique : si réponse libre, choisis l'option la plus proche parmi les options autorisées.
+2) Fidélité libellés : pour select/multi-select, utilise des libellés EXACTS présents dans les options (copier-coller).
+3) Ne reformule jamais un libellé d'option.
+4) Logique "Autre" : n'utilise "Autre" que si aucune option ne convient ; dans ce cas conserve le texte libre dans le champ "-Autre" associé quand il existe.
+7) Consentement RGPD (bool) : si l'utilisateur exprime un accord (ex: "oui", "d'accord", "ok", "j'accepte"), mets true ; sinon false.
 
-    DONNÉES
-    Transcript: ${JSON.stringify(transcript)}
-    Données brutes déjà collectées: ${JSON.stringify(rawData)}
-    Questions / options: ${JSON.stringify(questionsContext, null, 2)}
-  `.trim();
+DONNÉES
+Transcript: ${JSON.stringify(transcript)}
+Données brutes déjà collectées: ${JSON.stringify(rawData)}
+Questions / options: ${JSON.stringify(questionsContext, null, 2)}
+`.trim();
 
-    const aiPromise = ai.models.generateContent({
-      model: FLASH_MODEL,
-      contents: [{ parts: [{ text: prompt }] }],
-      config: {
-        responseMimeType: "application/json",
-        temperature: 0,
-      },
-    });
+    // Timeout client + support AbortSignal (si fourni)
+    const controller = new AbortController();
+    const clientTimeoutMs = 95_000; // doit être > timeout serveur (ex: 90s) + marge
+    const t = setTimeout(() => controller.abort(), clientTimeoutMs);
 
-    const timeoutPromise = new Promise((_, reject) => {
-      const t = setTimeout(() => reject(new Error("AI_NORMALIZE_TIMEOUT")), AI_NORMALIZE_TIMEOUT_MS);
-      signal?.addEventListener?.("abort", () => {
-        clearTimeout(t);
-        reject(new Error("AI_ABORTED"));
-      });
-    });
-
-    const response: any = await Promise.race([aiPromise, timeoutPromise]);
-
-    // Parsing tolérant (SDK peut exposer .text en string ou en function)
-    let candidate: Record<string, any> | null = null;
-    try {
-      const rawText =
-        typeof response?.text === "function"
-          ? response.text()
-          : (response?.text ?? "{}");
-
-      const cleaned = String(rawText).replace(/```json/g, "").replace(/```/g, "").trim();
-      const parsed = JSON.parse(cleaned || "{}");
-
-      candidate = parsed && typeof parsed === "object" ? parsed : null;
-    } catch {
-      candidate = null;
+    // Si on a déjà un signal (ex: submit global), on le chaîne au controller local
+    if (signal?.addEventListener) {
+      if (signal.aborted) controller.abort();
+      else signal.addEventListener("abort", () => controller.abort(), { once: true });
     }
 
-    // Contrat final garanti ici
+    const res = await fetch("/api/normalize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        transcript,
+        rawData,
+        questionsContext,
+        prompt,
+      }),
+    }).finally(() => clearTimeout(t));
+
+    // Même si serveur KO, on ne bloque pas : fallback garanti
+    if (!res.ok) {
+      return buildGuaranteedPayload(rawData, transcript, null);
+    }
+
+    const data = await res.json().catch(() => ({} as any));
+    const candidate = data?.candidate && typeof data.candidate === "object" ? data.candidate : null;
+
+    // Contrat final garanti ici (côté client)
     return buildGuaranteedPayload(rawData, transcript, candidate);
   } catch (e) {
-    console.error("normalizeAuditData guarded fail:", e);
+    console.error("normalizeAuditData server-proxy fail:", e);
     return buildGuaranteedPayload(rawData, transcript, null);
   }
 };
