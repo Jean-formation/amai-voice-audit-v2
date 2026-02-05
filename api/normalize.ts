@@ -40,9 +40,33 @@ export default async function handler(request: VercelRequest, response: VercelRe
 
     const ai = new GoogleGenAI({ apiKey });
 
+    // --- Guardrails de normalisation (Q01–Q05) : priorité sémantique ---
+    // Objectif : empêcher le modèle de tomber sur l'option la plus basse ("absence")
+    // quand la réponse indique clairement une maturité existante ("en cours", "structuré", "experts", etc.).
+    const SEMANTIC_PRIORITY_RULES = `
+    RÈGLE PRIORITAIRE — PRIORITÉ SÉMANTIQUE (Q01–Q05) :
+    - Ces questions mesurent une maturité. "Pas terminé" ne veut pas dire "inexistant".
+    - INTERDICTION : si la réponse utilisateur contient des indices d'existence / maturité, tu ne dois JAMAIS sélectionner l'option la plus basse (niveau 1 / absence).
+    Indices typiques d'existence / maturité :
+    - stratégie / déploiement : "en cours", "mise en œuvre", "pilotage", "POC", "test", "déployé partiellement"
+    - données : "structuré", "consolidé", "centralisé", "plateforme", "DWH", "data lake"
+    - compétences : "équipe", "experts", "ingénieurs", "développeurs", "R&D", "référent", "dédié"
+    Conséquence :
+    - si au moins un de ces indices apparaît, la valeur Q01–Q05 ne peut pas être le niveau 1.
+    - dans ce cas, choisis au minimum le niveau 2, voire 3 si les indices sont forts (ex. plateforme bien gérée, équipe dédiée solide).
+
+    EXEMPLES (à appliquer strictement) :
+    - "en cours de mise en œuvre" => Q01 ne peut pas être "pas de stratégie".
+    - "structurées, consolidées" => Q02 ne peut pas être "données cloisonnées et inaccessibles".
+    - "3 ingénieurs font de la R&D IA" => Q03 ne peut pas être "très faibles / peu ou pas d'expertise".
+    `;
+
+    const finalPrompt = `${prompt}\n\n${SEMANTIC_PRIORITY_RULES}`;
+
+
     const aiPromise = ai.models.generateContent({
       model: FLASH_MODEL,
-      contents: [{ parts: [{ text: prompt }] }],
+      contents: [{ parts: [{ text: finalPrompt }] }],
       config: {
         responseMimeType: 'application/json',
         temperature: 0,
