@@ -196,7 +196,7 @@ export const QUESTIONS: Question[] = [
   },
   {
     id: 'q17',
-    label: "Quels sont vos objectifs principaux en matière d'IA et numérique ?",
+    label: "Quels sont vos objectifs principaux en matière d'IA et numérique ? Par exemple : concevoir une application métier interne, mettre en place des outils de pilotage stratégique ou opérationnel, ou encore automatiser certains processus.",
     type: QuestionType.MULTI_SELECT,
     notionKey: "Objectifs IA-Digital",
     maxItems: 7,
@@ -218,7 +218,7 @@ export const QUESTIONS: Question[] = [
   },
   {
     id: 'q18',
-    label: "Quels sont vos principaux défis ?",
+    label: "Quels sont vos principaux défis ? Par exemple : Définir ou actualiser votre stratégie IA et Data, Automatiser des processus, Optimiser les marges, Renforcer la satisfaction client ?",
     type: QuestionType.MULTI_SELECT,
     notionKey: "Défis prioritaires (max 3)",
     maxItems: 3,
@@ -238,7 +238,7 @@ export const QUESTIONS: Question[] = [
   },
   {
     id: 'q19',
-    label: "Quelles sont vos attentes vis-à-vis de l'IA et du Digital ?",
+    label: "Quelles sont vos attentes vis-à-vis de l'IA et du Digital ? Par exemple : obtenir une proposition de valeur actualisée, bénéficier d’une approche stratégique, ou encore gagner en productivité.",
     type: QuestionType.MULTI_SELECT,
     notionKey: "Attentes IA-Digital",
     maxItems: 5,
