@@ -102,6 +102,9 @@ export default async function handler(request: VercelRequest, response: VercelRe
       candidate = null;
     }
 
+    // ... log temporaire après le parsing (candidate = ...)
+    console.log('NORMALIZE CANDIDATE:', JSON.stringify(candidate, null, 2));
+
     return response.status(200).json({ candidate });
   } catch (e) {
     console.error('api/normalize error:', e);
